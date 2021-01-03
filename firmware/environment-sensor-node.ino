@@ -6,21 +6,22 @@
 #include <SPI.h>
 #include <LowPower.h>
 #include <Wire.h>
-//#include <DHT.h>
 #include <Adafruit_BMP085.h>
 
 #include <RH_RF95.h>
 
-#define DHT_PIN 5     // what pin we're connected to
+#define DHT_PIN         5     // what pin we're connected to
 #define DHTTYPE DHT22   // DHT 22  (AM2302)
 
-#define POWER_DHT_PIN 6
-#define POWER_BPM_PIN 7
+#define POWER_DHT_PIN   6
+#define POWER_BPM_PIN   7
 #define POWER_VMETR_PIN 4
-#define V_PIN 3
-#define LED_PIN 8
+#define V_PIN           3
+#define LED_PIN         8
 
-    
+
+#define HEADER_FROM     0x0A    
+#define HEADER_TO       0x0B
 
 // Hardware configuration
 
@@ -32,7 +33,6 @@ RH_RF95 rf95(SS, 3, hardware_spi);
 
 // this is Message structure, which should be expected on receiver side
 struct Message {
-   char id[8] = "NODE0001";
    int32_t pressure;
    int32_t humidity;
    int32_t temperature;
@@ -41,6 +41,7 @@ struct Message {
 
 boolean pressure_sensor_ok = false;
 boolean radio_ok = false;
+uint8_t packet_id = 0;
 
 void setup(void) {
 
@@ -102,10 +103,10 @@ void setup(void) {
     rf95.setModemConfig(RH_RF95::Bw500Cr45Sf128);
     rf95.setPreambleLength(8);
   
-    rf95.setThisAddress(10);
-    rf95.setHeaderFrom(10);
-    rf95.setHeaderTo(60);
-    
+    rf95.setThisAddress(HEADER_FROM);
+    rf95.setHeaderFrom(HEADER_FROM);
+    rf95.setHeaderTo(HEADER_TO);
+
     #ifdef DEBUG
     Serial.println("OK."); 
     Serial.flush();
@@ -131,6 +132,8 @@ void loop(void){
   if(loopCount == 14)
   {
 
+    digitalWrite(POWER_VMETR_PIN, HIGH);
+    
     #ifdef DEBUG
     Serial.println("-> Waking up");
     Serial.flush();
@@ -139,29 +142,10 @@ void loop(void){
     readBMP();
     readDHT();
 
-    digitalWrite(POWER_VMETR_PIN, HIGH);
-    delay(1);
-/*  
+    
    
- [ reference voltatge / adc resulution ] 
- 1.1 / 1024 = 
- = 0.00107421875     
- 
- H = Vout / Vin = Z2 / (Z1 + Z2)
- = 100k / 562k + 100k = 0.151057401812689
- 
- = 6.6 ( 7.454545454545455 experimental ) 
- = 0.00708984375 ( 0.719730941704036 )
- voltage = ((float)analogRead(V_PIN)) * 0.00708984375;
-
-
- 
-
- 22pF charge time = 13 μs
-*/ 
-
-    // voltage * 100
-    msg.voltage = (analogRead(V_PIN) * 719730) / 1000000;
+    uint32_t u = readUBat(V_PIN);
+    msg.voltage = u; 
 
     
     digitalWrite(POWER_VMETR_PIN, LOW);
@@ -191,6 +175,30 @@ void loop(void){
   LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
 }
 
+
+#define      P_16   0xA001     //!< polynomial
+//variant for RAM
+uint16_t crc16(uint8_t *buf, uint16_t num)
+{
+ uint8_t i;
+ uint16_t crc = 0xffff;
+
+ while(num--)
+ {
+  crc ^= *buf++;
+  i = 8;
+  do
+  {
+   if (crc & 1)
+    crc = (crc >> 1) ^ P_16;
+   else
+    crc >>= 1;
+  } while(--i);
+ }
+ return(crc);
+}
+
+
 void sendData() {
 
     #ifdef DEBUG
@@ -200,10 +208,9 @@ void sendData() {
 
     //Power up the radio    
                  
-    LowPower.powerDown(SLEEP_15MS, ADC_OFF, BOD_OFF);
-
+    rf95.setHeaderId(packet_id++);
     rf95.send((uint8_t*) &msg, sizeof(msg));
-    rf95.waitPacketSent();
+    rf95.waitPacketSent(500);
     rf95.sleep();
 
 
@@ -221,12 +228,13 @@ void readBMP() {
       Serial.print("Reading BMP: "); 
       Serial.flush();
       #endif
-  
-      digitalWrite(POWER_BPM_PIN, HIGH);
+
       // enabling pull up 
       digitalWrite(SDA, HIGH);
       digitalWrite(SCL, HIGH);
-      
+      // power up
+      delayMicroseconds(25);
+      digitalWrite(POWER_BPM_PIN, HIGH);      
       delay(3);
       //LowPower.powerDown(SLEEP_15MS, ADC_OFF, BOD_OFF);
   
@@ -252,43 +260,44 @@ void readBMP() {
 
 }
 
-uint16_t analogReadN(uint8_t pin, uint8_t bits)
-{
-  bits = constrain(bits, 10, 16) -10;
-
-  int samples = 1 << (bits << 1);
-
-  uint32_t sum=0;
-  for (int i=0; i< samples; i++) sum += analogRead(pin);     
-  return sum >> bits;                             
-}
-
-/*
-void readDHT () {
-
-    dht.begin();
-    //delay(310);
-    LowPower.powerDown(SLEEP_500MS, ADC_OFF, BOD_OFF);
     
-    humidity = dht.readHumidity();
-    temperature = dht.readTemperature();
-    
+/*  
+   
+ [ reference voltatge / adc resulution ] 
+ 1.1 / 1024 = 
+ = 0.00107421875     
+ 
+ H = Vout / Vin = Z2 / (Z1 + Z2)
+ = 100k / 562k + 100k = 0.151057401812689
+ 
+ = 6.6 ( 7.454545454545455 experimental ) 
+ = 0.00708984375 ( 0.719730941704036 )
+ voltage = ((float)analogRead(V_PIN)) * 0.00708984375;
+
+
+ 22pF charge time = 13 μs
+
+*/ 
+uint32_t readUBat(uint8_t pin)
+{ 
+  delay(1);
+  uint32_t sum = 0;
+  for (int i=0; i < 4; i++) {
+    int in = analogRead(pin); 
+    sum += in;     
     #ifdef DEBUG
-    if (isnan(humidity) || isnan(temperature)) {
-      Serial.println("Failed to read from DHT sensor!");
-    } else { 
-      Serial.print("Temperature = ");
-      Serial.print(temperature);
-      Serial.println(" *C");
-
-      Serial.print("Humidity = ");
-      Serial.print(humidity);
-      Serial.println(" %");
-    }
-    Serial.flush();
+        int v = (in * 719730) / 1000000;
+        Serial.print("U = ");         
+        Serial.println(v); 
+        Serial.flush();
     #endif
+  }
+  sum = sum >> 2;
+  uint32_t u = (sum * 719730) / 1000000;
+  return u;                             
 }
-*/
+
+
 
 uint8_t _pin;
 uint32_t _maxcycles = microsecondsToClockCycles(1000);
